@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# tmh – Open host combinations with a fixed layout in tmux
+#
+# Command:  tmh <combination>
+# Reads:   ~/.config/tmh/<combination>   (directory can be changed via $TMH_DIR)
+#
+# File format, one line per area:
+#   <host>  <column>,<row>,<width>,<height>
+#
+#   stage1  0,0,80,15
+#   cm2     1,0,80,15
+#   auth1   0,1,161,15
+#
+# - <column>,<row> are positions in the grid (0,0 = top left), not characters.
+# - All sections within a row are given the greatest height specified there.
+# - If a row is narrower than the widest one, its last section is widened.
+# - There is a 1-character border between each section (80 + 1 + 80 = 161).
+# - Host "-" opens a local shell instead of ssh.
+# - Blank lines and lines beginning with # are ignored.
+
+set -euo pipefail
+
+dir=${TMH_DIR:-$HOME/.config/tmh}
+
+usage() {
+  echo "Usage: ${0##*/} <combination>"
+  local f found=
+  for f in "$dir"/*; do
+    [[ -f $f ]] || continue
+    [[ -z $found ]] && { echo; echo "Known combinations (in $dir):"; found=1; }
+    echo "  ${f##*/}"
+  done
+  [[ -n $found ]] || echo "No combinations found in $dir"
+}
+
+name=${1:-}
+case $name in
+  ""|-h|--help) usage >&2; exit 1 ;;
+esac
+conf=$dir/$name
+[[ -r $conf ]] || { echo "Unknown combination: $name" >&2; echo >&2; usage >&2; exit 1; }
+
+# Entries sorted by row, then column:  row column width height host
+entries=$(awk '!/^[[:space:]]*(#|$)/ {
+    n = split($2, a, ",")
+    if (n != 4) { print "Syntax error in line " NR ": " $0 > "/dev/stderr"; exit 1 }
+    printf "%d %d %d %d %s\n", a[2], a[1], a[3], a[4], $1
+  }' "$conf" | sort -n -k1,1 -k2,2)
+[[ -n $entries ]] || { echo "No entries in $conf" >&2; exit 1; }
+
+# Calculate the tmux layout string (without checksum):  width height layout
+read -r W H layout < <(awk '
+  {
+    r = $1; n[r]++; w[r, n[r]] = $3
+    if (!(r in seen)) { seen[r] = 1; rows[++nr] = r }
+    if ($4 > rh[r]) rh[r] = $4
+  }
+  END {
+    W = 0
+    for (i = 1; i <= nr; i++) {
+      r = rows[i]; s = n[r] - 1
+      for (j = 1; j <= n[r]; j++) s += w[r, j]
+      rw[r] = s; if (s > W) W = s
+    }
+    H = nr - 1
+    for (i = 1; i <= nr; i++) H += rh[rows[i]]
+
+    y = 0; id = 0; out = ""
+    for (i = 1; i <= nr; i++) {
+      r = rows[i]; w[r, n[r]] += W - rw[r]; x = 0; row = ""
+      for (j = 1; j <= n[r]; j++) {
+        row = row (j > 1 ? "," : "") sprintf("%dx%d,%d,%d,%d", w[r, j], rh[r], x, y, id++)
+        x += w[r, j] + 1
+      }
+      if (n[r] > 1) row = sprintf("%dx%d,0,%d{%s}", W, rh[r], y, row)
+      out = out (i > 1 ? "," : "") row
+      y += rh[r] + 1
+    }
+    if (nr > 1) out = sprintf("%dx%d,0,0[%s]", W, H, out)
+    print W, H, out
+  }' <<<"$entries")
+
+# Checksum like tmux (layout_checksum)
+csum=0
+for ((i = 0; i < ${#layout}; i++)); do
+  printf -v o '%d' "'${layout:i:1}"
+  csum=$(( ((csum >> 1) + ((csum & 1) << 15) + o) & 0xffff ))
+done
+printf -v layout '%04x,%s' "$csum" "$layout"
+
+# Command per host
+cmd_for() { [[ $1 == - ]] && echo "" || echo "ssh $1"; }
+
+hosts=()
+while read -r _ _ _ _ h; do hosts+=("$h"); done <<<"$entries"
+
+# Always start a new session: prod, prod-2, prod-3, ...
+sess=$name; n=2
+while tmux has-session -t "=$sess" 2>/dev/null; do sess=$name-$n; ((n++)); done
+
+# shellcheck disable=SC2046
+tmux new-session -d -s "$sess" -x "$W" -y "$H" $(cmd_for "${hosts[0]}")
+for h in "${hosts[@]:1}"; do
+  # shellcheck disable=SC2046
+  tmux split-window -t "$sess" $(cmd_for "$h")
+  tmux select-layout -t "$sess" tiled
+done
+tmux select-layout -t "$sess" "$layout"
+# Fixed size: resize-window sets window-size=manual, so tmux
+# no longer scales the layout to the attaching terminal
+tmux resize-window -t "$sess" -x "$W" -y "$H"
+tmux select-pane -t "$sess:0.0"
+tmux setw -t "$sess" synchronize-panes on
+
+# Resize the terminal window (macOS) so it fits the layout exactly.
+# 1. CSI 8;lines;cols t  – direct resize (iTerm2, Terminal.app, xterm; Ghostty ignores it)
+# 2. Fallback: query text area (CSI 14 t) and, if supported, cell size (CSI 16 t),
+#    then resize the frontmost window via System Events (Retina factor is derived).
+# Only outside tmux – inside tmux the sequences would be handled by tmux.
+read -r -d '' RESIZE_SCRIPT <<'EOF' || true
+on run argv
+  -- passed as positive numbers only: negative args would look like options
+  set wantC to (item 1 of argv) as integer
+  set wantL to (item 2 of argv) as integer
+  set curC to (item 3 of argv) as integer
+  set curL to (item 4 of argv) as integer
+  set textW to (item 5 of argv) as integer
+  set textH to (item 6 of argv) as integer
+  set cellW to (item 7 of argv) as integer
+  set cellH to (item 8 of argv) as integer
+  -- no cell size reported: derive it from the text area
+  if cellW is 0 then set cellW to textW / curC
+  if cellH is 0 then set cellH to textH / curL
+  tell application "System Events"
+    tell (first process whose frontmost is true)
+      set {winW, winH} to size of front window
+    end tell
+  end tell
+  set s to round (textW / winW)
+  if s < 1 then set s to 1
+  set newW to (winW + (wantC - curC) * cellW / s) as integer
+  set newH to (winH + (wantL - curL) * cellH / s) as integer
+  tell application "System Events"
+    tell (first process whose frontmost is true)
+      set size of front window to {newW, newH}
+    end tell
+  end tell
+end run
+EOF
+
+# query <n>: send CSI n t, print the two numbers of the reply ("h w")
+query() {
+  local _ a b
+  IFS=';' read -r -s -d t -t 1 -p $'\e['"$1"'t' _ a b </dev/tty 2>/dev/tty || true
+  echo "$a $b"
+}
+
+size_ok() {
+  cols=$(tput cols); lines=$(tput lines)
+  (( cols == $1 && lines == $2 ))
+}
+
+resize_terminal() {
+  local want_c=$1 want_l=$2 old ch cw th tw
+  [[ -z ${TMUX:-} ]] || { echo "tmh: inside tmux – not resizing the terminal" >&2; return 1; }
+  size_ok "$want_c" "$want_l" && return 0
+
+  # 1. direct resize via escape sequence
+  printf '\e[8;%d;%dt' "$want_l" "$want_c" >/dev/tty
+  sleep 0.5
+  size_ok "$want_c" "$want_l" && return 0
+
+  # 2. System Events
+  command -v osascript >/dev/null || { echo "tmh: osascript not found – not resizing" >&2; return 1; }
+  old=$(stty -g </dev/tty)
+  # discard pending input (e.g. leftovers after tmux exits), then query
+  stty -icanon -echo min 0 time 1 </dev/tty
+  dd bs=4096 count=1 </dev/tty >/dev/null 2>&1 || true
+  stty -icanon -echo min 1 time 0 </dev/tty
+  read -r th tw < <(query 14)
+  read -r ch cw < <(query 16)
+  stty "$old" </dev/tty
+  [[ $tw =~ ^[0-9]+$ && $th =~ ^[0-9]+$ ]] ||
+    { echo "tmh: terminal did not report its text area size (CSI 14 t) – not resizing" >&2; return 1; }
+  [[ $cw =~ ^[0-9]+$ && $ch =~ ^[0-9]+$ ]] || { cw=0; ch=0; }
+  echo "tmh: text area ${tw}x${th} px, resizing ${cols}x${lines} -> ${want_c}x${want_l}" >&2
+
+  if ! osascript -e "$RESIZE_SCRIPT" "$want_c" "$want_l" "$cols" "$lines" "$tw" "$th" "$cw" "$ch" >/dev/null; then
+    echo "tmh: osascript failed (Accessibility permission for the terminal app?)" >&2
+    return 1
+  fi
+  sleep 0.5
+  size_ok "$want_c" "$want_l" ||
+    { echo "tmh: terminal is ${cols}x${lines} after resizing, wanted ${want_c}x${want_l}" >&2; return 1; }
+}
+
+# remember the original terminal size to restore it afterwards
+orig_c=$(tput cols); orig_l=$(tput lines)
+
+if resize_terminal "$W" $((H + 1)); then
+  # Terminal fits exactly: let tmux scale the layout on later manual resizes
+  tmux set-window-option -t "$sess" window-size latest
+else
+  cols=$(tput cols); lines=$(tput lines)
+  if (( cols < W || lines < H + 1 )); then
+    echo "Warning: layout needs ${W}x$((H + 1)) (incl. status line), terminal is ${cols}x${lines} – parts will be cut off." >&2
+  fi
+  sleep 3
+fi
+
+if [[ -n ${TMUX:-} ]]; then
+  tmux switch-client -t "$sess"
+else
+  tmux attach -t "$sess" || true
+  # back to the original window size after detaching / when the session ends
+  echo "tmh: restoring terminal size ${orig_c}x${orig_l}" >&2
+  resize_terminal "$orig_c" "$orig_l" || true
+fi
